@@ -1,0 +1,12 @@
+{
+  "name": "havefoi-backend",
+  "version": "1.0.0",
+  "description": "Havefoi pet tag backend - accounts, tag claiming, pet profiles",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
