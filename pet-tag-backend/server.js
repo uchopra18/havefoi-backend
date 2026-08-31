@@ -1,29 +1,31 @@
-// Pet Tag Backend — accounts + QR tag claiming, no external dependencies.
-// Run with: node server.js
-// Data is stored in db.json (created automatically on first run).
+// Pet Tag Backend — accounts + QR tag claiming.
+// Run with: node server.js  (requires DATABASE_URL env var — see README)
 
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
 const crypto = require('crypto');
 const url = require('url');
+const db = require('./db');
 
-const DB_FILE = path.join(__dirname, 'db.json');
 const PORT = process.env.PORT || 3000;
 const SESSION_DAYS = 30;
 
-// ---------- tiny "database" (JSON file) ----------
-function loadDB() {
-  if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify({ users: {}, profiles: {}, sessions: {} }, null, 2));
-  }
-  return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-}
-function saveDB(db) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+function genId(bytes) { return crypto.randomBytes(bytes).toString('hex'); }
+
+// ---------- SMS notifications ----------
+// TODO: replace this mock with a real SMS gateway before going live, e.g.:
+//   - Twilio (international, easy API): https://www.twilio.com/docs/sms
+//   - MSG91 or Textlocal (India-focused, usually cheaper for domestic SMS)
+// This mock just logs the message and records it in sms_log so the flow
+// can be tested end-to-end without a real account/API key.
+function sendSMS(toPhone, message) {
+  console.log(`[SMS -> ${toPhone}]: ${message}`);
+  return { success: true, mock: true };
 }
 
-function genId(bytes) { return crypto.randomBytes(bytes).toString('hex'); }
+// Minimum time between two "scan" notifications for the same tag, so a finder
+// refreshing the page (or the owner scanning their own tag) doesn't spam the owner.
+const SCAN_NOTIFY_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
+
 
 // ---------- password hashing (scrypt, built into Node, no deps) ----------
 function hashPassword(password, salt) {
@@ -41,10 +43,21 @@ function sendJSON(res, status, data, extraHeaders) {
   res.writeHead(status, Object.assign({ 'Content-Type': 'application/json' }, extraHeaders || {}));
   res.end(JSON.stringify(data));
 }
+const MAX_BODY_BYTES = 2 * 1024 * 1024; // 2MB — enough for a compressed photo, not enough to abuse
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
-    req.on('data', c => (body += c));
+    let bytes = 0;
+    req.on('data', c => {
+      bytes += c.length;
+      if (bytes > MAX_BODY_BYTES) {
+        reject(new Error('PAYLOAD_TOO_LARGE'));
+        req.destroy();
+        return;
+      }
+      body += c;
+    });
     req.on('end', () => { try { resolve(body ? JSON.parse(body) : {}); } catch (e) { reject(e); } });
     req.on('error', reject);
   });
@@ -58,13 +71,13 @@ function parseCookies(req) {
   });
   return out;
 }
-function currentUser(req, db) {
+async function currentUser(req) {
   const cookies = parseCookies(req);
   const token = cookies.session;
   if (!token) return null;
-  const session = db.sessions[token];
+  const session = await db.getSession(token);
   if (!session || session.expiresAt < Date.now()) return null;
-  return db.users[session.userId] || null;
+  return db.getUserById(session.userId);
 }
 function setSessionCookie(token) {
   const maxAge = SESSION_DAYS * 24 * 60 * 60;
@@ -72,12 +85,7 @@ function setSessionCookie(token) {
 }
 
 // ---------- field definitions ----------
-const PUBLIC_FIELDS = ['petName', 'photoUrl', 'phone', 'notes'];
-const PRIVATE_FIELDS = [
-  'ownerName', 'address', 'altPhone', 'breed', 'age',
-  'medicalNotes', 'vetName', 'vetPhone', 'microchipId'
-];
-const ALL_FIELDS = [...PUBLIC_FIELDS, ...PRIVATE_FIELDS];
+const { PUBLIC_FIELDS, ALL_FIELDS } = db;
 
 function publicView(profile) {
   const out = {};
@@ -89,125 +97,153 @@ function publicView(profile) {
 const server = http.createServer(async (req, res) => {
   const parsed = url.parse(req.url, true);
   const parts = parsed.pathname.split('/').filter(Boolean);
+  console.log(`[REQ] ${req.method} ${parsed.pathname}`);
 
   try {
-    const db = loadDB();
-
     // ===== AUTH =====
     // POST /api/signup { email, password }
     if (req.method === 'POST' && parsed.pathname === '/api/signup') {
       const body = await readBody(req);
       if (!body.email || !body.password) return sendJSON(res, 400, { error: 'Email and password required' });
-      const existing = Object.values(db.users).find(u => u.email.toLowerCase() === body.email.toLowerCase());
+      const existing = await db.getUserByEmail(body.email);
       if (existing) return sendJSON(res, 409, { error: 'An account with this email already exists' });
 
       const { salt, hash } = hashPassword(body.password);
       const userId = genId(8);
-      db.users[userId] = { id: userId, email: body.email, salt, hash, createdAt: new Date().toISOString() };
+      await db.createUser({ id: userId, email: body.email, salt, hash });
 
       const token = genId(24);
-      db.sessions[token] = { userId, expiresAt: Date.now() + SESSION_DAYS * 86400000 };
-      saveDB(db);
+      const expiresAt = Date.now() + SESSION_DAYS * 86400000;
+      await db.createSession(token, userId, expiresAt);
       return sendJSON(res, 201, { success: true }, { 'Set-Cookie': setSessionCookie(token) });
     }
 
     // POST /api/login { email, password }
     if (req.method === 'POST' && parsed.pathname === '/api/login') {
       const body = await readBody(req);
-      const user = Object.values(db.users).find(u => u.email.toLowerCase() === (body.email || '').toLowerCase());
+      const user = await db.getUserByEmail(body.email || '');
       if (!user || !verifyPassword(body.password || '', user.salt, user.hash)) {
         return sendJSON(res, 401, { error: 'Invalid email or password' });
       }
       const token = genId(24);
-      db.sessions[token] = { userId: user.id, expiresAt: Date.now() + SESSION_DAYS * 86400000 };
-      saveDB(db);
+      const expiresAt = Date.now() + SESSION_DAYS * 86400000;
+      await db.createSession(token, user.id, expiresAt);
       return sendJSON(res, 200, { success: true }, { 'Set-Cookie': setSessionCookie(token) });
     }
 
     // POST /api/logout
     if (req.method === 'POST' && parsed.pathname === '/api/logout') {
       const cookies = parseCookies(req);
-      if (cookies.session) { delete db.sessions[cookies.session]; saveDB(db); }
+      if (cookies.session) await db.deleteSession(cookies.session);
       return sendJSON(res, 200, { success: true }, { 'Set-Cookie': 'session=; HttpOnly; Path=/; Max-Age=0' });
     }
 
     // GET /api/me
     if (req.method === 'GET' && parsed.pathname === '/api/me') {
-      const user = currentUser(req, db);
+      const user = await currentUser(req);
       if (!user) return sendJSON(res, 401, { error: 'Not logged in' });
       return sendJSON(res, 200, { email: user.email });
     }
 
     // ===== TAG PROVISIONING (you'd call this at manufacture time, e.g. behind an admin key) =====
     // POST /api/tags -> creates a blank, unclaimed tag. Returns publicId for the QR code.
+    // NOTE: for your real 500 manufactured tags, don't call this — use import_tags.js
+    // to load their actual printed IDs instead, so the app never invents an ID that
+    // doesn't match a real physical tag.
     if (req.method === 'POST' && parsed.pathname === '/api/tags') {
       const publicId = genId(4); // 8 chars
-      db.profiles[publicId] = { publicId, ownerId: null, createdAt: new Date().toISOString() };
-      for (const f of ALL_FIELDS) db.profiles[publicId][f] = '';
-      saveDB(db);
+      await db.createBlankProfile(publicId);
       return sendJSON(res, 201, { publicId, publicUrl: `/pet/${publicId}` });
     }
 
     // ===== CLAIMING A TAG =====
     // POST /api/tags/:publicId/claim  (requires login) — links an unclaimed tag to your account
     if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'tags' && parts[3] === 'claim') {
-      const user = currentUser(req, db);
+      const user = await currentUser(req);
       if (!user) return sendJSON(res, 401, { error: 'Log in first' });
-      const profile = db.profiles[parts[2]];
+      const profile = await db.getProfile(parts[2]);
       if (!profile) return sendJSON(res, 404, { error: 'No tag with that code' });
       if (profile.ownerId && profile.ownerId !== user.id) return sendJSON(res, 409, { error: 'This tag is already linked to another account' });
-      profile.ownerId = user.id;
-      saveDB(db);
+      await db.claimProfile(parts[2], user.id);
       return sendJSON(res, 200, { success: true });
     }
 
     // ===== OWNER'S DASHBOARD DATA =====
     // GET /api/my/profiles (requires login) — all tags linked to your account
     if (req.method === 'GET' && parsed.pathname === '/api/my/profiles') {
-      const user = currentUser(req, db);
+      const user = await currentUser(req);
       if (!user) return sendJSON(res, 401, { error: 'Log in first' });
-      const mine = Object.values(db.profiles).filter(p => p.ownerId === user.id);
+      const mine = await db.getProfilesByOwner(user.id);
       return sendJSON(res, 200, mine);
     }
 
     // ===== PUBLIC VIEW (what scanning the QR code returns) =====
     // GET /api/profiles/:publicId
-    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'profiles' && parts[2]) {
-      const profile = db.profiles[parts[2]];
+    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'profiles' && parts[2] && !parts[3]) {
+      const profile = await db.getProfile(parts[2]);
       if (!profile) return sendJSON(res, 404, { error: 'Not found' });
       const view = publicView(profile);
       view.claimed = !!profile.ownerId;
       return sendJSON(res, 200, view);
     }
 
+    // ===== SCAN NOTIFICATION =====
+    // POST /api/profiles/:publicId/scan — called by the public page when a finder
+    // views a *claimed* profile. Sends the owner an SMS, rate-limited so repeat
+    // views within the cooldown window don't spam them. Optional {lat, lng} from
+    // the finder's browser (only if they consented) gets included as a map link.
+    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'profiles' && parts[2] && parts[3] === 'scan') {
+      const profile = await db.getProfile(parts[2]);
+      if (!profile || !profile.ownerId) return sendJSON(res, 404, { error: 'Not found' });
+
+      const body = await readBody(req);
+      const now = Date.now();
+      const lastNotified = profile.lastScanNotifiedAt ? new Date(profile.lastScanNotifiedAt).getTime() : 0;
+
+      if (now - lastNotified < SCAN_NOTIFY_COOLDOWN_MS) {
+        return sendJSON(res, 200, { notified: false, reason: 'cooldown' });
+      }
+      if (!profile.phone) {
+        return sendJSON(res, 200, { notified: false, reason: 'no_contact_number' });
+      }
+
+      const petName = profile.petName || 'Your pet';
+      let message = `${petName}'s tag was just scanned.`;
+      if (body.lat && body.lng) {
+        message += ` The finder shared their location: https://maps.google.com/?q=${body.lat},${body.lng}`;
+      } else {
+        message += ` View their profile: ${req.headers.origin || ''}/pet/${parts[2]}`;
+      }
+
+      sendSMS(profile.phone, message);
+      await db.setScanNotified(parts[2]);
+      await db.logSMS(parts[2], profile.phone, message);
+      return sendJSON(res, 200, { notified: true });
+    }
+
     // ===== EDIT / DELETE a profile (requires login + ownership) =====
     // PUT /api/profiles/:publicId
     if (req.method === 'PUT' && parts[0] === 'api' && parts[1] === 'profiles' && parts[2]) {
-      const user = currentUser(req, db);
+      const user = await currentUser(req);
       if (!user) return sendJSON(res, 401, { error: 'Log in first' });
-      const profile = db.profiles[parts[2]];
+      const profile = await db.getProfile(parts[2]);
       if (!profile) return sendJSON(res, 404, { error: 'Not found' });
       if (profile.ownerId !== user.id) return sendJSON(res, 403, { error: 'This tag is not linked to your account' });
 
       const body = await readBody(req);
-      if (body.consentGiven !== undefined) profile.consentGiven = !!body.consentGiven;
-      for (const f of ALL_FIELDS) if (body[f] !== undefined) profile[f] = body[f];
-      saveDB(db);
+      await db.updateProfile(parts[2], body);
       return sendJSON(res, 200, { success: true });
     }
 
     // DELETE /api/profiles/:publicId — right-to-erasure: wipes personal data, keeps tag unclaimed & reusable
     if (req.method === 'DELETE' && parts[0] === 'api' && parts[1] === 'profiles' && parts[2]) {
-      const user = currentUser(req, db);
+      const user = await currentUser(req);
       if (!user) return sendJSON(res, 401, { error: 'Log in first' });
-      const profile = db.profiles[parts[2]];
+      const profile = await db.getProfile(parts[2]);
       if (!profile) return sendJSON(res, 404, { error: 'Not found' });
       if (profile.ownerId !== user.id) return sendJSON(res, 403, { error: 'This tag is not linked to your account' });
 
-      const publicId = profile.publicId;
-      db.profiles[publicId] = { publicId, ownerId: null, createdAt: profile.createdAt };
-      for (const f of ALL_FIELDS) db.profiles[publicId][f] = '';
-      saveDB(db);
+      await db.eraseProfile(parts[2]);
       return sendJSON(res, 200, { success: true });
     }
 
@@ -221,6 +257,10 @@ const server = http.createServer(async (req, res) => {
 
     sendJSON(res, 404, { error: 'Not found' });
   } catch (err) {
+    if (err.message === 'PAYLOAD_TOO_LARGE') {
+      return sendJSON(res, 413, { error: 'Photo is too large. Try a smaller image.' });
+    }
+    console.error(`[ERROR] ${req.method} ${req.url} ->`, err);
     sendJSON(res, 500, { error: err.message });
   }
 });
@@ -406,7 +446,32 @@ function publicPageHtml(publicId) {
           '<p style="font-size:1.1rem; color:var(--ink); font-weight:600; margin-bottom:4px">' + (p.phone||'') + '</p>' +
           '<p class="muted" style="margin-bottom:0">' + (p.notes||'') + '</p>' +
           '</div>' +
-          '<p class="muted" style="text-align:center">Found this pet? Please call the number above.</p>';
+          '<p class="muted" style="text-align:center">Found this pet? Please call the number above.</p>' +
+          '<div class="card" id="locationPrompt">' +
+          '<p style="margin-bottom:14px">Help ' + (p.petName || 'their') + '\\'s owner reach you faster — share your current location?</p>' +
+          '<button id="shareLocBtn" class="btn btn-primary btn-block" style="margin-bottom:8px">Share my location</button>' +
+          '<button id="skipLocBtn" class="btn btn-ghost btn-block">Skip</button>' +
+          '</div>';
+
+        function notifyOwner(coords) {
+          fetch('/api/profiles/' + publicId + '/scan', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify(coords || {})
+          }).finally(() => {
+            document.getElementById('locationPrompt').innerHTML = '<p class="muted" style="margin:0; text-align:center">Thanks — the owner has been notified.</p>';
+          });
+        }
+
+        document.getElementById('shareLocBtn').onclick = () => {
+          if (!navigator.geolocation) { notifyOwner(null); return; }
+          navigator.geolocation.getCurrentPosition(
+            (pos) => notifyOwner({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+            () => notifyOwner(null),
+            { timeout: 8000 }
+          );
+        };
+        document.getElementById('skipLocBtn').onclick = () => notifyOwner(null);
         return;
       }
 
@@ -447,7 +512,15 @@ function editPageHtml(publicId) {
     <div class="card">
       <p class="field-section-label" style="margin-top:0">Shown to anyone who scans the tag</p>
       <input name="petName" placeholder="Pet name">
-      <input name="photoUrl" placeholder="Photo URL">
+
+      <div style="margin-bottom:16px">
+        <img id="photoPreview" style="display:none; width:100%; max-width:220px; border-radius:12px; margin-bottom:10px">
+        <input type="hidden" name="photoUrl">
+        <input type="file" id="photoFile" accept="image/*">
+        <p id="photoMsg" class="muted" style="margin:6px 0 0; font-size:0.82rem"></p>
+        <a href="#" id="removePhoto" class="muted" style="display:none; font-size:0.82rem">Remove photo</a>
+      </div>
+
       <input name="phone" placeholder="Phone shown to finder">
       <textarea name="notes" placeholder="Notes for finder" rows="3"></textarea>
     </div>
@@ -471,6 +544,65 @@ function editPageHtml(publicId) {
   <script>
     const publicId = '${publicId}';
     const fields = ${JSON.stringify(fields)};
+
+    function showPreview(dataUrl) {
+      const preview = document.getElementById('photoPreview');
+      const removeLink = document.getElementById('removePhoto');
+      if (dataUrl) {
+        preview.src = dataUrl;
+        preview.style.display = 'block';
+        removeLink.style.display = 'inline';
+      } else {
+        preview.style.display = 'none';
+        removeLink.style.display = 'none';
+      }
+    }
+
+    // Resize + compress the image client-side before it ever leaves the browser,
+    // so a 5MB phone photo doesn't blow past the server's upload limit.
+    function resizeImage(file, maxDim, quality) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        const reader = new FileReader();
+        reader.onload = (e) => { img.src = e.target.result; };
+        reader.onerror = reject;
+        img.onload = () => {
+          let { width, height } = img;
+          if (width > height && width > maxDim) { height *= maxDim / width; width = maxDim; }
+          else if (height > maxDim) { width *= maxDim / height; height = maxDim; }
+          const canvas = document.createElement('canvas');
+          canvas.width = width; canvas.height = height;
+          canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+          resolve(canvas.toDataURL('image/jpeg', quality));
+        };
+        img.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    }
+
+    document.getElementById('photoFile').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const msg = document.getElementById('photoMsg');
+      msg.textContent = 'Processing...';
+      try {
+        const dataUrl = await resizeImage(file, 600, 0.7);
+        document.querySelector('[name=photoUrl]').value = dataUrl;
+        showPreview(dataUrl);
+        msg.textContent = 'Photo ready — click Save to keep it.';
+      } catch (err) {
+        msg.textContent = 'Could not process that image — try a different file.';
+      }
+    });
+
+    document.getElementById('removePhoto').onclick = (e) => {
+      e.preventDefault();
+      document.querySelector('[name=photoUrl]').value = '';
+      document.getElementById('photoFile').value = '';
+      document.getElementById('photoMsg').textContent = '';
+      showPreview(null);
+    };
+
     (async () => {
       const meR = await fetch('/api/me');
       if (!meR.ok) { location.href = '/login'; return; }
@@ -483,6 +615,7 @@ function editPageHtml(publicId) {
         const el = document.querySelector('[name='+k+']');
         if (el) el.value = profile[k] || '';
       }
+      showPreview(profile.photoUrl || null);
       document.querySelector('[name=consentGiven]').checked = !!profile.consentGiven;
     })();
     document.getElementById('f').onsubmit = async (e) => {
