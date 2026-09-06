@@ -21,15 +21,56 @@ const SESSION_DAYS = 30;
 
 function genId(bytes) { return crypto.randomBytes(bytes).toString('hex'); }
 
-// ---------- SMS notifications ----------
-// TODO: replace this mock with a real SMS gateway before going live, e.g.:
-//   - Twilio (international, easy API): https://www.twilio.com/docs/sms
-//   - MSG91 or Textlocal (India-focused, usually cheaper for domestic SMS)
-// This mock just logs the message and records it in sms_log so the flow
-// can be tested end-to-end without a real account/API key.
-function sendSMS(toPhone, message) {
-  console.log(`[SMS -> ${toPhone}]: ${message}`);
-  return { success: true, mock: true };
+// ---------- SMS notifications (MSG91) ----------
+// TODO before this sends real messages:
+//   1. Create an account at https://msg91.com
+//   2. Complete DLT registration (required by Indian telecom law for any SMS
+//      to Indian numbers) — register as an "entity", register a sender ID
+//      (6 letters, e.g. HAVFOI), and register the exact message template
+//      below word-for-word (DLT only allows pre-approved templates with
+//      {#var#} placeholders — you cannot send arbitrary free text).
+//      Suggested template to register:
+//        "{#var#}'s tag was just scanned. {#var#}"
+//      (first var = pet name, second var = either a maps link or profile link)
+//   3. Once approved, get your authkey (Dashboard -> API) and your approved
+//      flow_id (Dashboard -> Campaigns -> API -> Flows), then set these as
+//      Render environment variables: MSG91_AUTH_KEY, MSG91_SENDER_ID, MSG91_FLOW_ID
+const https = require('https');
+
+function sendSMS(toPhone, petName, detail) {
+  if (!process.env.MSG91_AUTH_KEY) {
+    console.log(`[SMS mock -> ${toPhone}]: ${petName}'s tag was just scanned. ${detail}`);
+    return;
+  }
+
+  const payload = JSON.stringify({
+    flow_id: process.env.MSG91_FLOW_ID,
+    sender: process.env.MSG91_SENDER_ID,
+    mobiles: '91' + toPhone.replace(/\D/g, '').slice(-10), // MSG91 wants country code, no symbols
+    var: petName,   // matches {#var#} #1 in the registered template
+    var1: detail,   // matches {#var#} #2
+  });
+
+  const req = https.request({
+    hostname: 'control.msg91.com',
+    path: '/api/v5/flow',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'authkey': process.env.MSG91_AUTH_KEY,
+      'Content-Length': Buffer.byteLength(payload),
+    },
+  }, (res) => {
+    let body = '';
+    res.on('data', (c) => body += c);
+    res.on('end', () => {
+      if (res.statusCode >= 400) console.error(`[SMS] MSG91 error (${res.statusCode}):`, body);
+      else console.log(`[SMS] sent to ${toPhone}`);
+    });
+  });
+  req.on('error', (e) => console.error('[SMS] Failed to reach MSG91:', e.message));
+  req.write(payload);
+  req.end();
 }
 
 // Minimum time between two "scan" notifications for the same tag, so a finder
@@ -239,16 +280,17 @@ const server = http.createServer(async (req, res) => {
       }
 
       const petName = profile.petName || 'Your pet';
-      let message = `${petName}'s tag was just scanned.`;
+      let detail;
       if (body.lat && body.lng) {
-        message += ` The finder shared their location: https://maps.google.com/?q=${body.lat},${body.lng}`;
+        detail = `The finder shared their location: https://maps.google.com/?q=${body.lat},${body.lng}`;
       } else {
-        message += ` View their profile: ${req.headers.origin || ''}/pet/${parts[2]}`;
+        detail = `View their profile: ${req.headers.origin || ''}/pet/${parts[2]}`;
       }
+      const logMessage = `${petName}'s tag was just scanned. ${detail}`;
 
-      sendSMS(profile.phone, message);
+      sendSMS(profile.phone, petName, detail);
       await db.setScanNotified(parts[2]);
-      await db.logSMS(parts[2], profile.phone, message);
+      await db.logSMS(parts[2], profile.phone, logMessage);
       return sendJSON(res, 200, { notified: true });
     }
 
