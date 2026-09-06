@@ -122,10 +122,34 @@ async function logSMS(publicId, toPhone, message) {
   );
 }
 
+// ---------- orders ----------
+async function createOrder(order) {
+  await pool.query(
+    `INSERT INTO orders (id, razorpay_order_id, status, quantity, amount_paise, customer_name, customer_phone, customer_email, address, city, pincode, pet_name)
+     VALUES ($1,$2,'pending',$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+    [order.id, order.razorpayOrderId, order.quantity, order.amountPaise, order.customerName, order.customerPhone, order.customerEmail, order.address, order.city, order.pincode, order.petName]
+  );
+}
+async function getOrderByRazorpayOrderId(razorpayOrderId) {
+  const r = await pool.query('SELECT * FROM orders WHERE razorpay_order_id = $1', [razorpayOrderId]);
+  return r.rows[0] || null;
+}
+async function getOrderById(id) {
+  const r = await pool.query('SELECT * FROM orders WHERE id = $1', [id]);
+  return r.rows[0] || null;
+}
+async function markOrderPaid(razorpayOrderId, razorpayPaymentId) {
+  await pool.query(
+    `UPDATE orders SET status = 'paid', razorpay_payment_id = $1 WHERE razorpay_order_id = $2`,
+    [razorpayPaymentId, razorpayOrderId]
+  );
+}
+
 module.exports = {
   pool, PUBLIC_FIELDS, PRIVATE_FIELDS, ALL_FIELDS,
   createUser, getUserById, getUserByEmail,
   createSession, getSession, deleteSession,
   createBlankProfile, getProfile, getProfilesByOwner, claimProfile, updateProfile, eraseProfile, setScanNotified,
   logSMS,
+  createOrder, getOrderByRazorpayOrderId, getOrderById, markOrderPaid,
 };

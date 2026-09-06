@@ -5,6 +5,16 @@ const http = require('http');
 const crypto = require('crypto');
 const url = require('url');
 const db = require('./db');
+const Razorpay = require('razorpay');
+
+// TODO: set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET as environment variables
+// (same way as DATABASE_URL) once you have a Razorpay account. Get test-mode
+// keys first from Razorpay Dashboard -> Settings -> API Keys, test the whole
+// flow with those (no real money moves), then switch to live keys once
+// Razorpay approves your account for live payments.
+const razorpay = process.env.RAZORPAY_KEY_ID
+  ? new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET })
+  : null;
 
 const PORT = process.env.PORT || 3000;
 const SESSION_DAYS = 30;
@@ -93,11 +103,32 @@ function publicView(profile) {
   return out;
 }
 
+// Requests to /api/* can come from havefoi.com (Netlify) even though this
+// server runs on a different domain (Render) — browsers block that
+// cross-origin call by default unless we explicitly allow it here.
+const ALLOWED_ORIGINS = [
+  'https://havefoi.com',
+  'https://www.havefoi.com',
+  'https://zingy-bonbon-815ecf.netlify.app',
+  'http://localhost:3000', // for local testing
+];
+function applyCors(req, res) {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
+}
+
 // ---------- routes ----------
 const server = http.createServer(async (req, res) => {
   const parsed = url.parse(req.url, true);
   const parts = parsed.pathname.split('/').filter(Boolean);
   console.log(`[REQ] ${req.method} ${parsed.pathname}`);
+
+  applyCors(req, res);
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
 
   try {
     // ===== AUTH =====
@@ -219,6 +250,95 @@ const server = http.createServer(async (req, res) => {
       await db.setScanNotified(parts[2]);
       await db.logSMS(parts[2], profile.phone, message);
       return sendJSON(res, 200, { notified: true });
+    }
+
+    // ===== PAYMENT: create an order =====
+    // POST /api/orders/create { quantity, name, phone, email, address, city, pincode, petName }
+    // Creates the order on Razorpay's side AND a 'pending' row in our own
+    // orders table, before any payment has happened. The frontend then opens
+    // Razorpay's checkout using the returned razorpayOrderId.
+    if (req.method === 'POST' && parsed.pathname === '/api/orders/create') {
+      if (!razorpay) return sendJSON(res, 500, { error: 'Payment gateway is not configured yet (missing RAZORPAY_KEY_ID/SECRET)' });
+      const body = await readBody(req);
+      const qty = Math.max(1, Math.min(10, parseInt(body.quantity, 10) || 1));
+      const UNIT_PRICE_RUPEES = 199; // keep in sync with order.html's UNIT_PRICE
+      const amountPaise = UNIT_PRICE_RUPEES * qty * 100;
+
+      if (!body.name || !body.phone || !body.email || !body.address || !body.city || !body.pincode) {
+        return sendJSON(res, 400, { error: 'All customer details are required' });
+      }
+
+      const orderId = genId(8);
+      const rpOrder = await razorpay.orders.create({
+        amount: amountPaise,
+        currency: 'INR',
+        receipt: orderId,
+      });
+
+      await db.createOrder({
+        id: orderId,
+        razorpayOrderId: rpOrder.id,
+        quantity: qty,
+        amountPaise,
+        customerName: body.name,
+        customerPhone: body.phone,
+        customerEmail: body.email,
+        address: body.address,
+        city: body.city,
+        pincode: body.pincode,
+        petName: body.petName || null,
+      });
+
+      return sendJSON(res, 201, {
+        orderId,
+        razorpayOrderId: rpOrder.id,
+        razorpayKeyId: process.env.RAZORPAY_KEY_ID,
+        amount: amountPaise,
+      });
+    }
+
+    // ===== PAYMENT: verify after Razorpay's checkout completes =====
+    // POST /api/orders/verify { razorpay_order_id, razorpay_payment_id, razorpay_signature }
+    // CRITICAL: this is the step that actually confirms payment happened.
+    // Razorpay's checkout widget calls a success handler in the browser
+    // regardless of what the browser "thinks" happened, so we never trust
+    // that alone — we recompute the expected signature server-side using
+    // our secret key and compare, exactly as Razorpay's docs specify.
+    if (req.method === 'POST' && parsed.pathname === '/api/orders/verify') {
+      const body = await readBody(req);
+      const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = body;
+      if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+        return sendJSON(res, 400, { error: 'Missing payment verification fields' });
+      }
+
+      const expectedSignature = crypto
+        .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+        .update(razorpay_order_id + '|' + razorpay_payment_id)
+        .digest('hex');
+
+      if (expectedSignature !== razorpay_signature) {
+        console.error(`[PAYMENT] Signature mismatch for order ${razorpay_order_id} — possible tampering attempt`);
+        return sendJSON(res, 400, { error: 'Payment verification failed' });
+      }
+
+      await db.markOrderPaid(razorpay_order_id, razorpay_payment_id);
+      const order = await db.getOrderByRazorpayOrderId(razorpay_order_id);
+      console.log(`[PAYMENT] Order ${order.id} verified paid — ₹${(order.amount_paise/100).toLocaleString('en-IN')}`);
+      return sendJSON(res, 200, { success: true, orderId: order.id });
+    }
+
+    // GET /api/orders/:id — used by the confirmation page to show order details
+    if (req.method === 'GET' && parts[0] === 'api' && parts[1] === 'orders' && parts[2]) {
+      const order = await db.getOrderById(parts[2]);
+      if (!order) return sendJSON(res, 404, { error: 'Order not found' });
+      return sendJSON(res, 200, {
+        id: order.id,
+        status: order.status,
+        quantity: order.quantity,
+        amount: order.amount_paise,
+        petName: order.pet_name,
+        customerName: order.customer_name,
+      });
     }
 
     // ===== EDIT / DELETE a profile (requires login + ownership) =====
