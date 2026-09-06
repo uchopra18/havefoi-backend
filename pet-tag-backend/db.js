@@ -145,11 +145,54 @@ async function markOrderPaid(razorpayOrderId, razorpayPaymentId) {
   );
 }
 
+async function updateUserPassword(userId, salt, hash) {
+  await pool.query('UPDATE users SET salt = $1, hash = $2 WHERE id = $3', [salt, hash, userId]);
+}
+
+// ---------- password resets ----------
+async function createPasswordReset(token, userId, expiresAt) {
+  await pool.query(
+    'INSERT INTO password_resets (token, user_id, expires_at) VALUES ($1, $2, $3)',
+    [token, userId, new Date(expiresAt)]
+  );
+}
+async function getPasswordReset(token) {
+  const r = await pool.query('SELECT * FROM password_resets WHERE token = $1', [token]);
+  const row = r.rows[0];
+  if (!row) return null;
+  return { userId: row.user_id, expiresAt: row.expires_at.getTime() };
+}
+async function deletePasswordReset(token) {
+  await pool.query('DELETE FROM password_resets WHERE token = $1', [token]);
+}
+
+async function getPaidOrders() {
+  const r = await pool.query("SELECT * FROM orders WHERE status = 'paid' ORDER BY created_at");
+  return r.rows;
+}
+async function assignTagsToOrder(orderId, tagIdsCsv) {
+  await pool.query('UPDATE orders SET assigned_tag_ids = $1 WHERE id = $2', [tagIdsCsv, orderId]);
+}
+async function markOrderShipped(orderId) {
+  await pool.query('UPDATE orders SET shipped = true WHERE id = $1', [orderId]);
+}
+async function findOrdersUsingTag(tagId, excludeOrderId) {
+  // used to stop the same physical tag being assigned to two different orders
+  const r = await pool.query(
+    `SELECT id FROM orders WHERE assigned_tag_ids IS NOT NULL
+     AND (',' || assigned_tag_ids || ',') LIKE $1 AND id != $2`,
+    [`%,${tagId},%`, excludeOrderId]
+  );
+  return r.rows;
+}
+
 module.exports = {
   pool, PUBLIC_FIELDS, PRIVATE_FIELDS, ALL_FIELDS,
-  createUser, getUserById, getUserByEmail,
+  createUser, getUserById, getUserByEmail, updateUserPassword,
   createSession, getSession, deleteSession,
   createBlankProfile, getProfile, getProfilesByOwner, claimProfile, updateProfile, eraseProfile, setScanNotified,
   logSMS,
   createOrder, getOrderByRazorpayOrderId, getOrderById, markOrderPaid,
+  createPasswordReset, getPasswordReset, deletePasswordReset,
+  getPaidOrders, assignTagsToOrder, markOrderShipped, findOrdersUsingTag,
 };

@@ -77,6 +77,46 @@ function sendSMS(toPhone, petName, detail) {
 // refreshing the page (or the owner scanning their own tag) doesn't spam the owner.
 const SCAN_NOTIFY_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
 
+// ---------- Email (Resend) ----------
+// TODO: sign up at https://resend.com, verify a sending domain (or use their
+// shared onboarding domain for quick testing), get an API key from the
+// dashboard, and set it as RESEND_API_KEY in Render's environment variables.
+// Much faster to set up than SMS/payment — no lengthy approval process.
+function sendEmail(to, subject, html) {
+  if (!process.env.RESEND_API_KEY) {
+    console.log(`[EMAIL mock -> ${to}] Subject: ${subject}\n${html}`);
+    return;
+  }
+  const payload = JSON.stringify({
+    from: process.env.RESEND_FROM_EMAIL || 'Havefoi <noreply@havefoi.com>',
+    to: [to],
+    subject,
+    html,
+  });
+  const req = https.request({
+    hostname: 'api.resend.com',
+    path: '/emails',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Length': Buffer.byteLength(payload),
+    },
+  }, (res) => {
+    let body = '';
+    res.on('data', (c) => body += c);
+    res.on('end', () => {
+      if (res.statusCode >= 400) console.error(`[EMAIL] Resend error (${res.statusCode}):`, body);
+      else console.log(`[EMAIL] sent to ${to}`);
+    });
+  });
+  req.on('error', (e) => console.error('[EMAIL] Failed to reach Resend:', e.message));
+  req.write(payload);
+  req.end();
+}
+
+const PASSWORD_RESET_EXPIRY_MS = 60 * 60 * 1000; // 1 hour
+
 
 // ---------- password hashing (scrypt, built into Node, no deps) ----------
 function hashPassword(password, salt) {
@@ -133,6 +173,14 @@ async function currentUser(req) {
 function setSessionCookie(token) {
   const maxAge = SESSION_DAYS * 24 * 60 * 60;
   return `session=${token}; HttpOnly; Path=/; Max-Age=${maxAge}; SameSite=Lax`;
+}
+
+// ---------- admin auth ----------
+// TODO: set ADMIN_KEY as a Render environment variable — pick a long random
+// string, not a memorable password. This gates the fulfillment/orders view.
+function isAdmin(req) {
+  const cookies = parseCookies(req);
+  return !!process.env.ADMIN_KEY && cookies.adminKey === process.env.ADMIN_KEY;
 }
 
 // ---------- field definitions ----------
@@ -215,6 +263,56 @@ const server = http.createServer(async (req, res) => {
       const user = await currentUser(req);
       if (!user) return sendJSON(res, 401, { error: 'Not logged in' });
       return sendJSON(res, 200, { email: user.email });
+    }
+
+    // ===== PASSWORD RECOVERY =====
+    // POST /api/forgot-password { email }
+    // Always responds the same way whether or not the email exists — this
+    // is deliberate, so this endpoint can't be used to check which emails
+    // have accounts (a common way real sites leak that information).
+    if (req.method === 'POST' && parsed.pathname === '/api/forgot-password') {
+      const body = await readBody(req);
+      const user = await db.getUserByEmail(body.email || '');
+      if (user) {
+        const token = genId(24);
+        await db.createPasswordReset(token, user.id, Date.now() + PASSWORD_RESET_EXPIRY_MS);
+        const resetLink = `${req.headers.origin || 'https://havefoi-backend.onrender.com'}/reset-password?token=${token}`;
+        sendEmail(
+          user.email,
+          'Reset your Havefoi password',
+          `<p>Someone requested a password reset for your Havefoi account.</p>
+           <p><a href="${resetLink}">Click here to set a new password</a> (link expires in 1 hour).</p>
+           <p>If you didn't request this, you can safely ignore this email.</p>`
+        );
+      }
+      return sendJSON(res, 200, { success: true });
+    }
+
+    // GET /forgot-password — the "request a reset" form
+    if (req.method === 'GET' && parsed.pathname === '/forgot-password') {
+      return serveHtml(res, forgotPasswordPageHtml());
+    }
+
+    // GET /reset-password?token=... — the page the link in the email opens
+    if (req.method === 'GET' && parsed.pathname === '/reset-password') {
+      return serveHtml(res, resetPasswordPageHtml(parsed.query.token || ''));
+    }
+
+    // POST /api/reset-password { token, newPassword }
+    if (req.method === 'POST' && parsed.pathname === '/api/reset-password') {
+      const body = await readBody(req);
+      if (!body.token || !body.newPassword) return sendJSON(res, 400, { error: 'Missing token or new password' });
+      if (body.newPassword.length < 8) return sendJSON(res, 400, { error: 'Password must be at least 8 characters' });
+
+      const reset = await db.getPasswordReset(body.token);
+      if (!reset || reset.expiresAt < Date.now()) {
+        return sendJSON(res, 400, { error: 'This reset link is invalid or has expired. Request a new one.' });
+      }
+
+      const { salt, hash } = hashPassword(body.newPassword);
+      await db.updateUserPassword(reset.userId, salt, hash);
+      await db.deletePasswordReset(body.token); // single-use
+      return sendJSON(res, 200, { success: true });
     }
 
     // ===== TAG PROVISIONING (you'd call this at manufacture time, e.g. behind an admin key) =====
@@ -366,6 +464,24 @@ const server = http.createServer(async (req, res) => {
       await db.markOrderPaid(razorpay_order_id, razorpay_payment_id);
       const order = await db.getOrderByRazorpayOrderId(razorpay_order_id);
       console.log(`[PAYMENT] Order ${order.id} verified paid — ₹${(order.amount_paise/100).toLocaleString('en-IN')}`);
+
+      if (order.customer_email) {
+        const itemLine = order.quantity === 1 ? 'Single Tag' : `${order.quantity}× Single Tag`;
+        sendEmail(
+          order.customer_email,
+          'Your Havefoi order is confirmed',
+          `<p>Hi ${order.customer_name || ''},</p>
+           <p>Thanks for your order — here's a quick summary:</p>
+           <ul>
+             <li><strong>Order ID:</strong> ${order.id}</li>
+             <li><strong>Item:</strong> ${itemLine}${order.pet_name ? ' · for ' + order.pet_name : ''}</li>
+             <li><strong>Amount paid:</strong> ₹${(order.amount_paise / 100).toLocaleString('en-IN')}</li>
+           </ul>
+           <p>We'll dispatch your tag within 1-2 business days. Once it arrives, scan the QR code with your phone to set up your pet's profile — takes under a minute.</p>
+           <p>— The Havefoi team</p>`
+        );
+      }
+
       return sendJSON(res, 200, { success: true, orderId: order.id });
     }
 
@@ -381,6 +497,55 @@ const server = http.createServer(async (req, res) => {
         petName: order.pet_name,
         customerName: order.customer_name,
       });
+    }
+
+    // ===== ADMIN (fulfillment) =====
+    // GET /admin — shows a login form, or the paid-orders view if already authenticated
+    if (req.method === 'GET' && parsed.pathname === '/admin') {
+      if (!isAdmin(req)) return serveHtml(res, adminLoginPageHtml());
+      const orders = await db.getPaidOrders();
+      return serveHtml(res, adminOrdersPageHtml(orders));
+    }
+
+    // POST /admin/login { key }
+    if (req.method === 'POST' && parsed.pathname === '/admin/login') {
+      const body = await readBody(req);
+      if (!process.env.ADMIN_KEY || body.key !== process.env.ADMIN_KEY) {
+        return sendJSON(res, 401, { error: 'Incorrect admin key' });
+      }
+      return sendJSON(res, 200, { success: true }, {
+        'Set-Cookie': `adminKey=${body.key}; HttpOnly; Path=/; Max-Age=${30*86400}; SameSite=Lax`
+      });
+    }
+
+    // POST /api/admin/orders/:id/assign-tags { tagIds: "abc123,def456" }
+    // Splits on commas, checks each tag actually exists, and checks none of
+    // them are already assigned to a *different* order — the safeguard
+    // against accidentally shipping the same physical tag to two customers.
+    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'admin' && parts[2] === 'orders' && parts[3] && parts[4] === 'assign-tags') {
+      if (!isAdmin(req)) return sendJSON(res, 401, { error: 'Admin login required' });
+      const orderId = parts[3];
+      const body = await readBody(req);
+      const tagIds = (body.tagIds || '').split(',').map(t => t.trim()).filter(Boolean);
+
+      for (const tagId of tagIds) {
+        const profile = await db.getProfile(tagId);
+        if (!profile) return sendJSON(res, 400, { error: `Tag ${tagId} doesn't exist — check for typos` });
+        const conflicts = await db.findOrdersUsingTag(tagId, orderId);
+        if (conflicts.length > 0) {
+          return sendJSON(res, 400, { error: `Tag ${tagId} is already assigned to order ${conflicts[0].id} — a physical tag can't go to two orders` });
+        }
+      }
+
+      await db.assignTagsToOrder(orderId, tagIds.join(','));
+      return sendJSON(res, 200, { success: true });
+    }
+
+    // POST /api/admin/orders/:id/ship
+    if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'admin' && parts[2] === 'orders' && parts[3] && parts[4] === 'ship') {
+      if (!isAdmin(req)) return sendJSON(res, 401, { error: 'Admin login required' });
+      await db.markOrderShipped(parts[3]);
+      return sendJSON(res, 200, { success: true });
     }
 
     // ===== EDIT / DELETE a profile (requires login + ownership) =====
@@ -517,6 +682,7 @@ function authPageHtml(mode) {
     <p id="err" class="error" style="margin-top:12px"></p>
   </div>
   <p id="switchLink" class="muted"></p>
+  ${isSignup ? '' : '<p><a href="/forgot-password" class="muted">Forgot password?</a></p>'}
   <script>
     const params = new URLSearchParams(location.search);
     const claimId = params.get('claim');
@@ -536,6 +702,116 @@ function authPageHtml(mode) {
         if (claimR.ok) { location.href = '/edit/' + claimId; return; }
       }
       location.href = '/dashboard';
+    };
+  </script>`);
+}
+
+function adminLoginPageHtml() {
+  return layout(`
+  <h1>Admin</h1>
+  <div class="card">
+    <form id="f">
+      <input name="key" type="password" placeholder="Admin key" required>
+      <button type="submit" class="btn btn-primary btn-block">Log in</button>
+    </form>
+    <p id="err" class="error" style="margin-top:12px"></p>
+  </div>
+  <script>
+    document.getElementById('f').onsubmit = async (e) => {
+      e.preventDefault();
+      const data = Object.fromEntries(new FormData(e.target));
+      const r = await fetch('/admin/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) });
+      if (!r.ok) { document.getElementById('err').textContent = 'Incorrect key'; return; }
+      location.reload();
+    };
+  </script>`);
+}
+
+function adminOrdersPageHtml(orders) {
+  const rows = orders.map(o => `
+    <div class="card" style="margin-bottom:16px">
+      <p><strong>${o.id}</strong> ${o.shipped ? '<span style="color:var(--teal)">✓ shipped</span>' : ''}</p>
+      <p class="muted">${o.customer_name} · ${o.customer_phone} · ${o.customer_email}</p>
+      <p class="muted">${o.address}, ${o.city} ${o.pincode}</p>
+      <p>${o.quantity === 1 ? 'Single Tag' : o.quantity + '× Single Tag'}${o.pet_name ? ' · for ' + o.pet_name : ''} — ₹${(o.amount_paise/100).toLocaleString('en-IN')}</p>
+      <div style="display:flex; gap:8px; margin-top:10px">
+        <input type="text" value="${o.assigned_tag_ids || ''}" placeholder="Tag ID(s), comma-separated" data-order="${o.id}" class="tagInput" style="flex:1">
+        <button class="btn btn-primary saveBtn" data-order="${o.id}">Save</button>
+        ${!o.shipped ? `<button class="btn btn-block shipBtn" data-order="${o.id}" style="width:auto">Mark shipped</button>` : ''}
+      </div>
+      <p class="msg" data-order="${o.id}" style="margin-top:6px; font-size:0.85rem"></p>
+    </div>
+  `).join('');
+
+  return layout(`
+  <h1>Orders to fulfill</h1>
+  <p class="muted">${orders.length} paid order${orders.length === 1 ? '' : 's'}</p>
+  ${rows || '<p class="muted">No paid orders yet.</p>'}
+  <script>
+    document.querySelectorAll('.saveBtn').forEach(btn => {
+      btn.onclick = async () => {
+        const orderId = btn.dataset.order;
+        const tagIds = document.querySelector('.tagInput[data-order="' + orderId + '"]').value;
+        const msg = document.querySelector('.msg[data-order="' + orderId + '"]');
+        const r = await fetch('/api/admin/orders/' + orderId + '/assign-tags', {
+          method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ tagIds })
+        });
+        const j = await r.json();
+        msg.textContent = r.ok ? 'Saved.' : j.error;
+        msg.style.color = r.ok ? 'var(--teal)' : '#B23A3A';
+      };
+    });
+    document.querySelectorAll('.shipBtn').forEach(btn => {
+      btn.onclick = async () => {
+        await fetch('/api/admin/orders/' + btn.dataset.order + '/ship', { method: 'POST' });
+        location.reload();
+      };
+    });
+  </script>`);
+}
+
+function forgotPasswordPageHtml() {
+  return layout(`
+  <h1>Reset your password</h1>
+  <div class="card">
+    <form id="f">
+      <input name="email" type="email" placeholder="Your account email" required>
+      <button type="submit" class="btn btn-primary btn-block">Send reset link</button>
+    </form>
+    <p id="msg" style="margin-top:12px"></p>
+  </div>
+  <script>
+    document.getElementById('f').onsubmit = async (e) => {
+      e.preventDefault();
+      const data = Object.fromEntries(new FormData(e.target));
+      await fetch('/api/forgot-password', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) });
+      document.getElementById('f').style.display = 'none';
+      document.getElementById('msg').textContent = "If an account exists for that email, we've sent a reset link. Check your inbox.";
+    };
+  </script>`);
+}
+
+function resetPasswordPageHtml(token) {
+  return layout(`
+  <h1>Set a new password</h1>
+  <div class="card">
+    <form id="f">
+      <input name="newPassword" type="password" placeholder="New password (min. 8 characters)" required minlength="8">
+      <button type="submit" class="btn btn-primary btn-block">Update password</button>
+    </form>
+    <p id="msg" style="margin-top:12px"></p>
+  </div>
+  <script>
+    document.getElementById('f').onsubmit = async (e) => {
+      e.preventDefault();
+      const data = Object.fromEntries(new FormData(e.target));
+      data.token = ${JSON.stringify(token)};
+      const r = await fetch('/api/reset-password', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) });
+      const j = await r.json();
+      if (!r.ok) { document.getElementById('msg').textContent = j.error; document.getElementById('msg').className = 'error'; return; }
+      document.getElementById('f').style.display = 'none';
+      document.getElementById('msg').textContent = 'Password updated. You can now log in.';
+      setTimeout(() => location.href = '/login', 1500);
     };
   </script>`);
 }
