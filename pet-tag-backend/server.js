@@ -272,7 +272,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ===== PASSWORD RECOVERY =====
-    // POST /api/contact { name, email, message } — from the Contact Us page
+    // POST /api/contact { name, email, orderId, message } — from the Contact Us page
     if (req.method === 'POST' && parsed.pathname === '/api/contact') {
       const body = await readBody(req);
       if (!body.name || !body.email || !body.message) {
@@ -282,6 +282,7 @@ const server = http.createServer(async (req, res) => {
         'support@havefoi.com',
         `Contact form: ${escapeHtml(body.name)}`,
         `<p><strong>From:</strong> ${escapeHtml(body.name)} (${escapeHtml(body.email)})</p>
+         ${body.orderId ? `<p><strong>Order ID:</strong> ${escapeHtml(body.orderId)}</p>` : ''}
          <p><strong>Message:</strong></p>
          <p>${escapeHtml(body.message).replace(/\n/g, '<br>')}</p>`
       );
