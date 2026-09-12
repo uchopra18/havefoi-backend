@@ -491,17 +491,20 @@ const server = http.createServer(async (req, res) => {
       const itemLine = order.quantity === 1 ? 'Single Tag' : `${order.quantity}× Single Tag`;
 
       if (order.customer_email) {
+        const petLabel = order.pet_name || 'your pet';
+        const petSubject = order.pet_name || 'them'; // avoids "your pet...every pet" repetition in the opening line
         sendEmail(
           order.customer_email,
           'Your Havefoi order is confirmed',
           `<p>Hi ${order.customer_name || ''},</p>
-           <p>Thanks for your order — here's a quick summary:</p>
+           <p>You just gave ${petSubject} something every pet deserves — a way home, no matter what.</p>
+           <p>Here's your order:</p>
            <ul>
              <li><strong>Order ID:</strong> ${order.id}</li>
              <li><strong>Item:</strong> ${itemLine}${order.pet_name ? ' · for ' + order.pet_name : ''}</li>
              <li><strong>Amount paid:</strong> ₹${(order.amount_paise / 100).toLocaleString('en-IN')}</li>
            </ul>
-           <p>We'll dispatch your tag within 1-2 business days. Once it arrives, scan the QR code with your phone to set up your pet's profile — takes under a minute.</p>
+           <p>We'll dispatch your tag within 1-2 business days. Once it arrives, scan the QR code with your phone to set up ${petLabel}'s profile — takes under a minute. From then on, any stranger who finds ${petLabel} will know exactly how to reach you, day or night.</p>
            <p>— The Havefoi team</p>`
         );
       }
