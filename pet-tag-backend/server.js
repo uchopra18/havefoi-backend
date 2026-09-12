@@ -401,7 +401,7 @@ const server = http.createServer(async (req, res) => {
       if (!razorpay) return sendJSON(res, 500, { error: 'Payment gateway is not configured yet (missing RAZORPAY_KEY_ID/SECRET)' });
       const body = await readBody(req);
       const qty = Math.max(1, Math.min(10, parseInt(body.quantity, 10) || 1));
-      const UNIT_PRICE_RUPEES = 199; // keep in sync with order.html's UNIT_PRICE
+      const UNIT_PRICE_RUPEES = 249; // keep in sync with order.html's UNIT_PRICE — includes free shipping
       const amountPaise = UNIT_PRICE_RUPEES * qty * 100;
 
       if (!body.name || !body.phone || !body.email || !body.address || !body.city || !body.pincode) {
