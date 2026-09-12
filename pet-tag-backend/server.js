@@ -130,6 +130,12 @@ function verifyPassword(password, salt, hash) {
 }
 
 // ---------- helpers ----------
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function sendJSON(res, status, data, extraHeaders) {
   res.writeHead(status, Object.assign({ 'Content-Type': 'application/json' }, extraHeaders || {}));
   res.end(JSON.stringify(data));
@@ -266,6 +272,22 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ===== PASSWORD RECOVERY =====
+    // POST /api/contact { name, email, message } — from the Contact Us page
+    if (req.method === 'POST' && parsed.pathname === '/api/contact') {
+      const body = await readBody(req);
+      if (!body.name || !body.email || !body.message) {
+        return sendJSON(res, 400, { error: 'Name, email, and message are all required' });
+      }
+      sendEmail(
+        'support@havefoi.com',
+        `Contact form: ${escapeHtml(body.name)}`,
+        `<p><strong>From:</strong> ${escapeHtml(body.name)} (${escapeHtml(body.email)})</p>
+         <p><strong>Message:</strong></p>
+         <p>${escapeHtml(body.message).replace(/\n/g, '<br>')}</p>`
+      );
+      return sendJSON(res, 200, { success: true });
+    }
+
     // POST /api/forgot-password { email }
     // Always responds the same way whether or not the email exists — this
     // is deliberate, so this endpoint can't be used to check which emails
@@ -465,8 +487,9 @@ const server = http.createServer(async (req, res) => {
       const order = await db.getOrderByRazorpayOrderId(razorpay_order_id);
       console.log(`[PAYMENT] Order ${order.id} verified paid — ₹${(order.amount_paise/100).toLocaleString('en-IN')}`);
 
+      const itemLine = order.quantity === 1 ? 'Single Tag' : `${order.quantity}× Single Tag`;
+
       if (order.customer_email) {
-        const itemLine = order.quantity === 1 ? 'Single Tag' : `${order.quantity}× Single Tag`;
         sendEmail(
           order.customer_email,
           'Your Havefoi order is confirmed',
@@ -481,6 +504,24 @@ const server = http.createServer(async (req, res) => {
            <p>— The Havefoi team</p>`
         );
       }
+
+      // Merchant alert — lets you know a real order came in without needing
+      // to keep checking /admin manually. Fires regardless of whether the
+      // customer's own email is on file, since this is about you knowing
+      // about the order, not about the customer's confirmation.
+      sendEmail(
+        'support@havefoi.com',
+        `New order — ₹${(order.amount_paise / 100).toLocaleString('en-IN')} (${order.id})`,
+        `<p>New paid order just came in:</p>
+         <ul>
+           <li><strong>Order ID:</strong> ${order.id}</li>
+           <li><strong>Item:</strong> ${itemLine}${order.pet_name ? ' · for ' + order.pet_name : ''}</li>
+           <li><strong>Amount:</strong> ₹${(order.amount_paise / 100).toLocaleString('en-IN')}</li>
+           <li><strong>Customer:</strong> ${order.customer_name} · ${order.customer_phone} · ${order.customer_email}</li>
+           <li><strong>Ship to:</strong> ${order.address}, ${order.city} ${order.pincode}</li>
+         </ul>
+         <p><a href="https://havefoi-backend.onrender.com/admin">Open the fulfillment dashboard</a> to assign a tag and mark it shipped.</p>`
+      );
 
       return sendJSON(res, 200, { success: true, orderId: order.id });
     }
