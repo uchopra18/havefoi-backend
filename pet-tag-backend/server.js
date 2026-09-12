@@ -514,7 +514,14 @@ const server = http.createServer(async (req, res) => {
         return sendJSON(res, 401, { error: 'Incorrect admin key' });
       }
       return sendJSON(res, 200, { success: true }, {
-        'Set-Cookie': `adminKey=${body.key}; HttpOnly; Path=/; Max-Age=${30*86400}; SameSite=Lax`
+        'Set-Cookie': `adminKey=${body.key}; HttpOnly; Path=/; Max-Age=${12*60*60}; SameSite=Lax`
+      });
+    }
+
+    // POST /admin/logout — clears the admin session immediately
+    if (req.method === 'POST' && parsed.pathname === '/admin/logout') {
+      return sendJSON(res, 200, { success: true }, {
+        'Set-Cookie': 'adminKey=; HttpOnly; Path=/; Max-Age=0'
       });
     }
 
@@ -744,10 +751,17 @@ function adminOrdersPageHtml(orders) {
   `).join('');
 
   return layout(`
-  <h1>Orders to fulfill</h1>
+  <div style="display:flex; justify-content:space-between; align-items:center">
+    <h1>Orders to fulfill</h1>
+    <button class="btn" id="logoutBtn" style="width:auto">Log out</button>
+  </div>
   <p class="muted">${orders.length} paid order${orders.length === 1 ? '' : 's'}</p>
   ${rows || '<p class="muted">No paid orders yet.</p>'}
   <script>
+    document.getElementById('logoutBtn').onclick = async () => {
+      await fetch('/admin/logout', { method: 'POST' });
+      location.reload();
+    };
     document.querySelectorAll('.saveBtn').forEach(btn => {
       btn.onclick = async () => {
         const orderId = btn.dataset.order;
